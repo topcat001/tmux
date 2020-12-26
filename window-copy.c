@@ -69,7 +69,7 @@ static char    *window_copy_stringify(struct grid *, u_int, u_int, u_int,
 static void	window_copy_cstrtocellpos(struct grid *, u_int, u_int *,
 		    u_int *, const char *);
 static int	window_copy_search_marks(struct window_mode_entry *,
-		    struct screen *, int);
+		    struct screen *, int, int);
 static void	window_copy_clear_marks(struct window_mode_entry *);
 static void	window_copy_move_left(struct screen *, u_int *, u_int *, int);
 static int	window_copy_is_lowercase(const char *);
@@ -270,6 +270,9 @@ struct window_copy_mode_data {
 	int		 searchregex;
 	char		*searchstr;
 	u_char		*searchmark;
+	int		 searchcount;
+	int		 searchmore;
+	int		 searchall;
 	int		 searchx;
 	int		 searchy;
 	int		 searcho;
@@ -277,6 +280,7 @@ struct window_copy_mode_data {
 
 	int		 timeout;	/* search has timed out */
 #define WINDOW_COPY_SEARCH_TIMEOUT 10000
+#define WINDOW_COPY_SEARCH_ALL_TIMEOUT 200
 
 	int		 jumptype;
 	char		 jumpchar;
@@ -392,6 +396,7 @@ window_copy_common_init(struct window_mode_entry *wme)
 		data->searchstr = NULL;
 	}
 	data->searchx = data->searchy = data->searcho = -1;
+	data->searchall = 1;
 
 	data->jumptype = WINDOW_COPY_OFF;
 	data->jumpchar = '\0';
@@ -585,7 +590,7 @@ window_copy_pageup1(struct window_mode_entry *wme, int half_page)
 	}
 
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 1, 0);
 	window_copy_redraw_screen(wme);
 }
@@ -635,7 +640,7 @@ window_copy_pagedown(struct window_mode_entry *wme, int half_page,
 	if (scroll_exit && data->oy == 0)
 		return (1);
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 1, 0);
 	window_copy_redraw_screen(wme);
 	return (0);
@@ -773,7 +778,7 @@ window_copy_size_changed(struct window_mode_entry *wme)
 	screen_write_stop(&ctx);
 
 	if (search && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 0);
 	data->searchx = data->cx;
 	data->searchy = data->cy;
 	data->searcho = data->oy;
@@ -1169,7 +1174,7 @@ window_copy_cmd_history_bottom(struct window_copy_cmd_state *cs)
 	data->oy = 0;
 
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 1, 0);
 	return (WINDOW_COPY_CMD_REDRAW);
 }
@@ -1190,7 +1195,7 @@ window_copy_cmd_history_top(struct window_copy_cmd_state *cs)
 	data->oy = screen_hsize(data->backing);
 
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 1, 0);
 	return (WINDOW_COPY_CMD_REDRAW);
 }
@@ -2370,7 +2375,7 @@ window_copy_scroll_to(struct window_mode_entry *wme, u_int px, u_int py,
 	}
 
 	if (!no_redraw && data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 1, 0);
 	if (!no_redraw)
 		window_copy_redraw_screen(wme);
@@ -2914,7 +2919,7 @@ window_copy_search(struct window_mode_entry *wme, int direction, int regex,
 	struct grid			*gd = s->grid;
 	const char			*str = data->searchstr;
 	u_int				 fx, fy, endline, i, foundlen;
-	int				 wrapflag, cis, found;
+	int				 wrapflag, cis, found, visible_only;
 
 	if (regex && str[strcspn(str, "^$*+()?[].\\")] == '\0')
 		regex = 0;
@@ -2922,6 +2927,12 @@ window_copy_search(struct window_mode_entry *wme, int direction, int regex,
 	if (data->timeout)
 		return (0);
 
+	if (data->searchall || wp->searchstr == NULL ||
+	    wp->searchregex != regex) {
+		visible_only = 0;
+		data->searchall = 0;
+	} else
+		visible_only = (strcmp(wp->searchstr, str) == 0);
 	free(wp->searchstr);
 	wp->searchstr = xstrdup(str);
 	wp->searchregex = regex;
@@ -2948,7 +2959,7 @@ window_copy_search(struct window_mode_entry *wme, int direction, int regex,
 	found = window_copy_search_jump(wme, gd, ss.grid, fx, fy, endline, cis,
 	    wrapflag, direction, regex, &foundlen);
 	if (found) {
-		window_copy_search_marks(wme, &ss, regex);
+		window_copy_search_marks(wme, &ss, regex, visible_only);
 		if (foundlen != 0) {
 			for (i = 0; i < foundlen; i++)
 				window_copy_cursor_right(wme, 1);
@@ -2992,19 +3003,19 @@ window_copy_search_mark_at(struct window_copy_mode_data *data, u_int px,
 
 static int
 window_copy_search_marks(struct window_mode_entry *wme, struct screen *ssp,
-    int regex)
+    int regex, int visible_only)
 {
 	struct window_copy_mode_data	*data = wme->data;
 	struct screen			*s = data->backing, ss;
 	struct screen_write_ctx		 ctx;
 	struct grid			*gd = s->grid;
-	int				 found, cis, which = -1;
+	int				 found, cis, which = -1, stopped = 0;
 	int				 cflags = REG_EXTENDED;
 	u_int				 px, py, i, b, nfound = 0, width;
 	u_int				 ssize = 1, start, end;
 	char				*sbuf;
 	regex_t				 reg;
-	uint64_t			 tstart, t;
+	uint64_t			 stop = 0, tstart, t;
 
 	if (ssp == NULL) {
 		width = screen_write_strlen("%s", data->searchstr);
@@ -3033,8 +3044,16 @@ window_copy_search_marks(struct window_mode_entry *wme, struct screen *ssp,
 		free(sbuf);
 	}
 	tstart = get_timer();
-	window_copy_visible_lines(data, &start, &end);
 
+	if (visible_only)
+		window_copy_visible_lines(data, &start, &end);
+	else {
+		start = 0;
+		end = gd->hsize + gd->sy;
+		stop = get_timer() + WINDOW_COPY_SEARCH_ALL_TIMEOUT;
+	}
+
+again:
 	free(data->searchmark);
 	data->searchmark = xcalloc(gd->sx, gd->sy);
 	data->searchgen = 1;
@@ -3078,10 +3097,38 @@ window_copy_search_marks(struct window_mode_entry *wme, struct screen *ssp,
 			data->timeout = 1;
 			break;
 		}
+		if (stop != 0 && t > stop) {
+			stopped = 1;
+			break;
+		}
 	}
 	if (data->timeout) {
 		window_copy_clear_marks(wme);
 		goto out;
+	}
+
+	if (stopped && stop != 0) {
+		/* Try again but just the visible context. */
+		window_copy_visible_lines(data, &start, &end);
+		stop = 0;
+		goto again;
+	}
+
+	if (!visible_only) {
+		if (stopped) {
+			if (nfound > 1000)
+				data->searchcount = 1000;
+			else if (nfound > 100)
+				data->searchcount = 100;
+			else if (nfound > 10)
+				data->searchcount = 10;
+			else
+				data->searchcount = -1;
+			data->searchmore = 1;
+		} else {
+			data->searchcount = nfound;
+			data->searchmore = 0;
+		}
 	}
 
 out:
@@ -3302,12 +3349,24 @@ window_copy_write_line(struct window_mode_entry *wme,
 	mkgc.flags |= GRID_FLAG_NOPALETTE;
 
 	if (py == 0 && s->rupper < s->rlower && !data->hide_position) {
-		if (data->searchmark == NULL && data->timeout) {
-			size = xsnprintf(hdr, sizeof hdr,
-			    "(timed out) [%u/%u]", data->oy, hsize);
+		if (data->searchmark == NULL) {
+			if (data->timeout) {
+				size = xsnprintf(hdr, sizeof hdr,
+				    "(timed out) [%u/%u]", data->oy, hsize);
+			} else {
+				size = xsnprintf(hdr, sizeof hdr,
+				    "[%u/%u]", data->oy, hsize);
+			}
 		} else {
-			size = xsnprintf(hdr, sizeof hdr,
-			    "[%u/%u]", data->oy, hsize);
+			if (data->searchcount == -1) {
+				size = xsnprintf(hdr, sizeof hdr,
+				    "[%u/%u]", data->oy, hsize);
+			} else {
+				size = xsnprintf(hdr, sizeof hdr,
+				    "(%d%s results) [%u/%u]", data->searchcount,
+				    data->searchmore ? "+" : "", data->oy,
+				    hsize);
+			}
 		}
 		if (size > screen_size_x(s))
 			size = screen_size_x(s);
@@ -4605,7 +4664,7 @@ window_copy_scroll_up(struct window_mode_entry *wme, u_int ny)
 	data->oy -= ny;
 
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 0, 0);
 
 	screen_write_start_pane(&ctx, wp, NULL);
@@ -4641,7 +4700,7 @@ window_copy_scroll_down(struct window_mode_entry *wme, u_int ny)
 	data->oy += ny;
 
 	if (data->searchmark != NULL && !data->timeout)
-		window_copy_search_marks(wme, NULL, data->searchregex);
+		window_copy_search_marks(wme, NULL, data->searchregex, 1);
 	window_copy_update_selection(wme, 0, 0);
 
 	screen_write_start_pane(&ctx, wp, NULL);
